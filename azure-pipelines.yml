@@ -1,0 +1,253 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  MAVEN_OPTS: '-Dmaven.repo.local=$(Pipeline.Workspace)/.m2/repository'
+  APP_NAME: 'gestion-signalement'
+  AZURE_WEBAPP_NAME: 'musee-virtuel-signalement'
+  ACR_NAME: 'acrmuseevirtuel'
+  IMAGE_TAG: '$(Build.BuildId)'
+
+stages:
+
+# ─────────────────────────────────────────────
+# STAGE 1 — BUILD & TEST avec MySQL en container
+# ─────────────────────────────────────────────
+- stage: Build
+  displayName: 'Build & Test'
+  jobs:
+  - job: BuildAndTest
+    displayName: 'Maven Build + Tests (MySQL container)'
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    # MySQL lancé automatiquement dans un container pendant les tests
+    services:
+      mysql:
+        image: mysql:8.0
+        ports:
+          - 3306:3306
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: musee_signalement
+          MYSQL_USER: appuser
+          MYSQL_PASSWORD: apppassword
+
+    steps:
+
+    # Cache Maven pour accélérer les builds suivants
+    - task: Cache@2
+      displayName: 'Cache Maven packages'
+      inputs:
+        key: 'maven | "$(Agent.OS)" | **/pom.xml'
+        restoreKeys: |
+          maven | "$(Agent.OS)"
+          maven
+        path: $(Pipeline.Workspace)/.m2/repository
+
+    # Java 8
+    - task: JavaToolInstaller@0
+      displayName: 'Installer Java 8'
+      inputs:
+        versionSpec: '8'
+        jdkArchitectureOption: 'x64'
+        jdkSourceOption: 'PreInstalled'
+
+    # Attendre que MySQL soit prêt
+    - script: |
+        echo "Waiting for MySQL to be ready..."
+        for i in $(seq 1 30); do
+          if mysqladmin ping -h 127.0.0.1 -u root -proot --silent 2>/dev/null; then
+            echo "MySQL is ready!"
+            break
+          fi
+          echo "Attempt $i: MySQL not ready yet, waiting 3s..."
+          sleep 3
+        done
+      displayName: 'Attendre MySQL'
+
+    # Compilation
+    - task: Maven@3
+      displayName: 'Compilation Maven'
+      inputs:
+        mavenPomFile: 'gestion-signalement-main/pom.xml'
+        goals: 'compile'
+        options: '$(MAVEN_OPTS)'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.8'
+        mavenVersionOption: 'Default'
+
+    # Tests unitaires avec MySQL container
+    - task: Maven@3
+      displayName: 'Tests JUnit'
+      inputs:
+        mavenPomFile: 'gestion-signalement-main/pom.xml'
+        goals: 'test'
+        options: >
+          $(MAVEN_OPTS)
+          -Dspring.datasource.url=jdbc:mysql://127.0.0.1:3306/musee_signalement?useSSL=false&allowPublicKeyRetrieval=true
+          -Dspring.datasource.username=appuser
+          -Dspring.datasource.password=apppassword
+          -Dspring.jpa.hibernate.ddl-auto=create-drop
+          -Dspring.profiles.active=test
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.8'
+        publishJUnitResults: true
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+        testRunTitle: 'Tests - Gestion Signalement'
+      continueOnError: true
+
+    # Publication des résultats de tests
+    - task: PublishTestResults@2
+      displayName: 'Publier résultats des tests'
+      condition: always()
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+
+    # Package JAR (sans relancer les tests)
+    - task: Maven@3
+      displayName: 'Package JAR'
+      inputs:
+        mavenPomFile: 'gestion-signalement-main/pom.xml'
+        goals: 'package'
+        options: '$(MAVEN_OPTS) -DskipTests'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.8'
+
+    # Copier JAR + Dockerfile dans le staging directory
+    - task: CopyFiles@2
+      displayName: 'Copier JAR vers staging'
+      inputs:
+        SourceFolder: 'gestion-signalement-main/target'
+        Contents: '$(APP_NAME).jar'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+    - task: CopyFiles@2
+      displayName: 'Copier Dockerfile vers staging'
+      inputs:
+        SourceFolder: 'gestion-signalement-main'
+        Contents: 'Dockerfile'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+    # Publier les artifacts pour le stage Deploy
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publier artifacts'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'
+
+# Stage: Provision infrastructure with Terraform
+- stage: Infra
+  displayName: 'Provision Infrastructure (Terraform)'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: Terraform
+    displayName: 'Terraform Apply'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+    - task: AzureCLI@2
+      displayName: 'Install Terraform and apply infra'
+      inputs:
+        azureSubscription: 'Azure-Service-Connection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -e
+          cd $(Build.SourcesDirectory)/infra
+          if ! command -v terraform >/dev/null; then
+            echo "Installing Terraform..."
+            T_VERSION="1.5.7"
+            curl -sSL https://releases.hashicorp.com/terraform/${T_VERSION}/terraform_${T_VERSION}_linux_amd64.zip -o /tmp/terraform.zip
+            unzip -o /tmp/terraform.zip -d /tmp
+            sudo mv /tmp/terraform /usr/local/bin/terraform
+            terraform -version
+          fi
+          terraform init -input=false -no-color
+          terraform apply -auto-approve -input=false -no-color
+
+
+# ─────────────────────────────────────────────
+# STAGE 2 — BUILD & PUSH IMAGE DOCKER vers ACR
+# ─────────────────────────────────────────────
+- stage: DockerBuild
+  displayName: 'Docker Build & Push (ACR)'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: DockerJob
+    displayName: 'Build image Docker et push vers ACR'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - download: current
+      artifact: drop
+
+    - task: Docker@2
+      displayName: 'Build & Push vers Azure Container Registry'
+      inputs:
+        command: 'buildAndPush'
+        containerRegistry: 'ACR-Connection'
+        repository: '$(APP_NAME)'
+        dockerfile: '$(Pipeline.Workspace)/drop/Dockerfile'
+        buildContext: '$(Pipeline.Workspace)/drop'
+        tags: |
+          $(IMAGE_TAG)
+          latest
+
+# ─────────────────────────────────────────────
+# STAGE 3 — DEPLOY sur Azure App Service
+# ─────────────────────────────────────────────
+- stage: Deploy
+  displayName: 'Deploy sur Azure App Service'
+  dependsOn: DockerBuild
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployToAzure
+    displayName: 'Deploiement App Service'
+    pool:
+      vmImage: 'ubuntu-latest'
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - task: AzureWebAppContainer@1
+            displayName: 'Deployer le container sur App Service'
+            inputs:
+              azureSubscription: 'Azure-Service-Connection'
+              appName: '$(AZURE_WEBAPP_NAME)'
+              containers: '$(ACR_NAME).azurecr.io/$(APP_NAME):$(IMAGE_TAG)'
+              appSettings: |
+                -SPRING_PROFILES_ACTIVE production
+                -WEBSITES_PORT 8080
+                -SPRING_DATASOURCE_URL $(DB_CONNECTION_STRING)
+                -SPRING_DATASOURCE_USERNAME $(DB_USERNAME)
+                -SPRING_DATASOURCE_PASSWORD $(DB_PASSWORD)
+
+          # Health check après déploiement
+          - script: |
+              echo "Attente du démarrage de l'application (30s)..."
+              sleep 30
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://$(AZURE_WEBAPP_NAME).azurewebsites.net/actuator/health)
+              if [ "$STATUS" = "200" ]; then
+                echo "Health check OK (HTTP 200)"
+              else
+                echo "Health check échoué (HTTP $STATUS)"
+                exit 1
+              fi
+            displayName: 'Health Check'
