@@ -1,0 +1,42 @@
+server:
+  ssl:
+    key-store: classpath:aec.jks
+    key-store-password: password
+    key-store-type: jks
+    key-alias: aec
+    key-password: password
+  port: 8180
+  servlet:
+    context-path: /aec-api-rest
+
+spring:
+  application:
+    name: gestion-annonce
+  main:
+    banner-mode: 'off'
+  session:
+    timeout: 86400
+  jackson:
+    default-property-inclusion: non-null
+    serialization:
+      indent-output: true
+  servlet:
+    multipart:
+      max-file-size: 500KB
+      max-request-size: 500KB
+        
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://mysql.cq1dnlwpoqbk.us-east-2.rds.amazonaws.com:3306/signalementDb?createDatabaseIfNotExist=true&serverTimezone=UTC
+    username: admin
+    password: admin123
+  
+  data:
+    jpa:
+      repositories:
+        enabled: true
+  
+  jpa:
+    database-platform: org.hibernate.dialect.MySQL5InnoDBDialect
+    hibernate:
+      ddl-auto: create
