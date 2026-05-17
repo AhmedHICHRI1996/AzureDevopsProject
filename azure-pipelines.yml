@@ -10,11 +10,17 @@ pr:
       - main
 
 variables:
-  MAVEN_OPTS: '-Dmaven.repo.local=$(Pipeline.Workspace)/.m2/repository'
-  APP_NAME: 'gestion-signalement'
-  AZURE_WEBAPP_NAME: 'musee-virtuel-signalement'
-  ACR_NAME: 'acrmuseevirtuel'
-  IMAGE_TAG: '$(Build.BuildId)'
+- group: esprit  # variable group containing DOCKERHUB_USERNAME and DOCKERHUB_PASSWORD
+- name: MAVEN_OPTS
+  value: '-Dmaven.repo.local=$(Pipeline.Workspace)/.m2/repository'
+- name: APP_NAME
+  value: 'gestion-signalement'
+- name: AZURE_WEBAPP_NAME
+  value: 'musee-virtuel-signalement'
+- name: IMAGE_TAG
+  value: '$(Build.BuildId)'
+- name: DOCKERHUB_REPO
+  value: 'ahmedhichri1996/gestion-signalement'
 
 stages:
 
@@ -180,15 +186,15 @@ stages:
 
 
 # ─────────────────────────────────────────────
-# STAGE 2 — BUILD & PUSH IMAGE DOCKER vers ACR
+# STAGE 2 — BUILD & PUSH IMAGE DOCKER vers Docker Hub
 # ─────────────────────────────────────────────
 - stage: DockerBuild
-  displayName: 'Docker Build & Push (ACR)'
+  displayName: 'Docker Build & Push (Docker Hub)'
   dependsOn: Build
   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
   jobs:
   - job: DockerJob
-    displayName: 'Build image Docker et push vers ACR'
+    displayName: 'Build image Docker et push vers Docker Hub'
     pool:
       vmImage: 'ubuntu-latest'
     steps:
@@ -196,17 +202,20 @@ stages:
     - download: current
       artifact: drop
 
-    - task: Docker@2
-      displayName: 'Build & Push vers Azure Container Registry'
-      inputs:
-        command: 'buildAndPush'
-        containerRegistry: 'ACR-Connection'
-        repository: '$(APP_NAME)'
-        dockerfile: '$(Pipeline.Workspace)/drop/Dockerfile'
-        buildContext: '$(Pipeline.Workspace)/drop'
-        tags: |
-          $(IMAGE_TAG)
-          latest
+    # Build Docker image and push directly to Docker Hub.
+    # Ensure DOCKERHUB_USERNAME and DOCKERHUB_PASSWORD pipeline variables are set (mark password as secret).
+    - script: |
+        echo "Building Docker image from staging drop..."
+        docker --version || true
+        cd $(Pipeline.Workspace)/drop
+        docker build -t $(DOCKERHUB_REPO):$(IMAGE_TAG) -f Dockerfile .
+        docker tag $(DOCKERHUB_REPO):$(IMAGE_TAG) $(DOCKERHUB_REPO):latest
+        echo "Logging in to Docker Hub"
+        echo "$(DOCKERHUB_PASSWORD)" | docker login -u "$(DOCKERHUB_USERNAME)" --password-stdin
+        echo "Pushing image $(DOCKERHUB_REPO):$(IMAGE_TAG) to Docker Hub"
+        docker push $(DOCKERHUB_REPO):$(IMAGE_TAG)
+        docker push $(DOCKERHUB_REPO):latest
+      displayName: 'Build & Push to Docker Hub'
 
 # ─────────────────────────────────────────────
 # STAGE 3 — DEPLOY sur Azure App Service
@@ -226,12 +235,32 @@ stages:
         deploy:
           steps:
 
+          # If your Docker Hub repository is private, you must provide registry credentials to the App Service.
+          # Option A (portal): In Azure Portal > App Service > Deployment Center, add Docker Hub credentials.
+          # Option B (pipeline/CLI): Uncomment the AzureCLI task below to set credentials programmatically.
+          # Note: the pipeline variables $(DOCKERHUB_USERNAME) and $(DOCKERHUB_PASSWORD) must be set (password marked secret).
+          #
+          # - task: AzureCLI@2
+          #   displayName: 'Configure App Service to pull from private Docker Hub'
+          #   inputs:
+          #     azureSubscription: 'Azure-Service-Connection'
+          #     scriptType: 'bash'
+          #     scriptLocation: 'inlineScript'
+          #     inlineScript: |
+          #       az webapp config container set \
+          #         --name $(AZURE_WEBAPP_NAME) \
+          #         --resource-group <RESOURCE_GROUP_NAME> \
+          #         --docker-custom-image-name $(DOCKERHUB_REPO):$(IMAGE_TAG) \
+          #         --docker-registry-server-url https://index.docker.io \
+          #         --docker-registry-server-user $(DOCKERHUB_USERNAME) \
+          #         --docker-registry-server-password $(DOCKERHUB_PASSWORD)
+
           - task: AzureWebAppContainer@1
             displayName: 'Deployer le container sur App Service'
             inputs:
               azureSubscription: 'Azure-Service-Connection'
               appName: '$(AZURE_WEBAPP_NAME)'
-              containers: '$(ACR_NAME).azurecr.io/$(APP_NAME):$(IMAGE_TAG)'
+              containers: '$(DOCKERHUB_REPO):$(IMAGE_TAG)'
               appSettings: |
                 -SPRING_PROFILES_ACTIVE production
                 -WEBSITES_PORT 8080
