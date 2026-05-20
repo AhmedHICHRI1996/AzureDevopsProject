@@ -39,7 +39,7 @@ stages:
   - job: BuildAndTest
     displayName: 'Maven Build + Tests'
     pool:
-      name: LocalVM    # agent auto-hébergé local
+      name: Default    # agent auto-hébergé local
 
     services:
       mysql:
@@ -148,7 +148,7 @@ stages:
   - job: DockerJob
     displayName: 'Build & Push Docker Hub'
     pool:
-      name: LocalVM
+      name: Default
 
     steps:
     - download: current
@@ -181,7 +181,7 @@ stages:
   - deployment: DeployLocal
     displayName: 'docker-compose pull + up'
     pool:
-      name: LocalVM
+      name: Default
     environment: 'production'
     strategy:
       runOnce:
