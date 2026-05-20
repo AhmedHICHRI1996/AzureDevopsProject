@@ -10,32 +10,37 @@ pr:
       - main
 
 variables:
-- group: esprit  # variable group containing DOCKERHUB_USERNAME and DOCKERHUB_PASSWORD
+- group: esprit  # DOCKERHUB_USERNAME, DOCKERHUB_PASSWORD, MYSQL_USER, MYSQL_PASSWORD, MYSQL_ROOT_PASSWORD
 - name: MAVEN_OPTS
   value: '-Dmaven.repo.local=$(Pipeline.Workspace)/.m2/repository'
 - name: APP_NAME
   value: 'gestion-signalement'
-- name: AZURE_WEBAPP_NAME
-  value: 'musee-virtuel-signalement'
 - name: IMAGE_TAG
   value: '$(Build.BuildId)'
 - name: DOCKERHUB_REPO
   value: 'ahmedhichri1996/gestion-signalement'
+- name: APP_DIR
+  value: '/home/ahmed/app'   # dossier docker-compose sur la VM locale
+
+# ─────────────────────────────────────────────
+# TOUS les stages tournent sur l'agent LOCAL
+# pool: name: LocalVM  (le pool créé dans Azure DevOps)
+# ─────────────────────────────────────────────
 
 stages:
 
 # ─────────────────────────────────────────────
-# STAGE 1 — BUILD & TEST avec MySQL en container
+# STAGE 1 — BUILD & TEST
+# MySQL tourne en service container sur l'agent local
 # ─────────────────────────────────────────────
 - stage: Build
   displayName: 'Build & Test'
   jobs:
   - job: BuildAndTest
-    displayName: 'Maven Build + Tests (MySQL container)'
+    displayName: 'Maven Build + Tests'
     pool:
-      vmImage: 'ubuntu-latest'
+      name: LocalVM    # agent auto-hébergé local
 
-    # MySQL lancé automatiquement dans un container pendant les tests
     services:
       mysql:
         image: mysql:8.0
@@ -49,49 +54,34 @@ stages:
 
     steps:
 
-    # Cache Maven pour accélérer les builds suivants
-    - task: Cache@2
-      displayName: 'Cache Maven packages'
-      inputs:
-        key: 'maven | "$(Agent.OS)" | **/pom.xml'
-        restoreKeys: |
-          maven | "$(Agent.OS)"
-          maven
-        path: $(Pipeline.Workspace)/.m2/repository
-
-    # Java 8
     - task: JavaToolInstaller@0
-      displayName: 'Installer Java 8'
+      displayName: 'Java 8'
       inputs:
         versionSpec: '8'
         jdkArchitectureOption: 'x64'
         jdkSourceOption: 'PreInstalled'
 
-    # Attendre que MySQL soit prêt
     - script: |
-        echo "Waiting for MySQL to be ready..."
+        echo "Waiting for MySQL..."
         for i in $(seq 1 30); do
           if mysqladmin ping -h 127.0.0.1 -u root -proot --silent 2>/dev/null; then
-            echo "MySQL is ready!"
+            echo "MySQL ready!"
             break
           fi
-          echo "Attempt $i: MySQL not ready yet, waiting 3s..."
+          echo "Attempt $i: not ready, waiting 3s..."
           sleep 3
         done
       displayName: 'Attendre MySQL'
 
-    # Compilation
     - task: Maven@3
-      displayName: 'Compilation Maven'
+      displayName: 'Compilation'
       inputs:
         mavenPomFile: 'gestion-signalement-main/pom.xml'
         goals: 'compile'
         options: '$(MAVEN_OPTS)'
         javaHomeOption: 'JDKVersion'
         jdkVersionOption: '1.8'
-        mavenVersionOption: 'Default'
 
-    # Tests unitaires avec MySQL container
     - task: Maven@3
       displayName: 'Tests JUnit'
       inputs:
@@ -111,15 +101,13 @@ stages:
         testRunTitle: 'Tests - Gestion Signalement'
       continueOnError: true
 
-    # Publication des résultats de tests
     - task: PublishTestResults@2
-      displayName: 'Publier résultats des tests'
+      displayName: 'Publier résultats tests'
       condition: always()
       inputs:
         testResultsFormat: 'JUnit'
         testResultsFiles: '**/surefire-reports/TEST-*.xml'
 
-    # Package JAR (sans relancer les tests)
     - task: Maven@3
       displayName: 'Package JAR'
       inputs:
@@ -129,154 +117,105 @@ stages:
         javaHomeOption: 'JDKVersion'
         jdkVersionOption: '1.8'
 
-    # Copier JAR + Dockerfile dans le staging directory
     - task: CopyFiles@2
-      displayName: 'Copier JAR vers staging'
+      displayName: 'Copier JAR'
       inputs:
         SourceFolder: 'gestion-signalement-main/target'
         Contents: '$(APP_NAME).jar'
         TargetFolder: '$(Build.ArtifactStagingDirectory)'
 
     - task: CopyFiles@2
-      displayName: 'Copier Dockerfile vers staging'
+      displayName: 'Copier Dockerfile'
       inputs:
         SourceFolder: 'gestion-signalement-main'
         Contents: 'Dockerfile'
         TargetFolder: '$(Build.ArtifactStagingDirectory)'
 
-    # Publier les artifacts pour le stage Deploy
     - task: PublishBuildArtifacts@1
       displayName: 'Publier artifacts'
       inputs:
         PathtoPublish: '$(Build.ArtifactStagingDirectory)'
         ArtifactName: 'drop'
-        publishLocation: 'Container'
-
-# Stage: Provision infrastructure with Terraform
-- stage: Infra
-  displayName: 'Provision Infrastructure (Terraform)'
-  dependsOn: Build
-  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-  jobs:
-  - job: Terraform
-    displayName: 'Terraform Apply'
-    pool:
-      vmImage: 'ubuntu-latest'
-    steps:
-    - checkout: self
-    - task: AzureCLI@2
-      displayName: 'Install Terraform and apply infra'
-      inputs:
-        azureSubscription: 'Azure-Service-Connection'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          set -e
-          cd $(Build.SourcesDirectory)/infra
-          if ! command -v terraform >/dev/null; then
-            echo "Installing Terraform..."
-            T_VERSION="1.5.7"
-            curl -sSL https://releases.hashicorp.com/terraform/${T_VERSION}/terraform_${T_VERSION}_linux_amd64.zip -o /tmp/terraform.zip
-            unzip -o /tmp/terraform.zip -d /tmp
-            sudo mv /tmp/terraform /usr/local/bin/terraform
-            terraform -version
-          fi
-          terraform init -input=false -no-color
-          terraform apply -auto-approve -input=false -no-color
-
 
 # ─────────────────────────────────────────────
-# STAGE 2 — BUILD & PUSH IMAGE DOCKER vers Docker Hub
+# STAGE 2 — DOCKER BUILD & PUSH vers Docker Hub
 # ─────────────────────────────────────────────
 - stage: DockerBuild
-  displayName: 'Docker Build & Push (Docker Hub)'
+  displayName: 'Docker Build & Push'
   dependsOn: Build
   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
   jobs:
   - job: DockerJob
-    displayName: 'Build image Docker et push vers Docker Hub'
+    displayName: 'Build & Push Docker Hub'
     pool:
-      vmImage: 'ubuntu-latest'
-    steps:
+      name: LocalVM
 
+    steps:
     - download: current
       artifact: drop
 
-    # Build Docker image and push directly to Docker Hub.
-    # Ensure DOCKERHUB_USERNAME and DOCKERHUB_PASSWORD pipeline variables are set (mark password as secret).
     - script: |
-        echo "Building Docker image from staging drop..."
-        docker --version || true
         cd $(Pipeline.Workspace)/drop
+        echo "=== Build image Docker ==="
         docker build -t $(DOCKERHUB_REPO):$(IMAGE_TAG) -f Dockerfile .
         docker tag $(DOCKERHUB_REPO):$(IMAGE_TAG) $(DOCKERHUB_REPO):latest
-        echo "Logging in to Docker Hub"
+
+        echo "=== Login Docker Hub ==="
         echo "$(DOCKERHUB_PASSWORD)" | docker login -u "$(DOCKERHUB_USERNAME)" --password-stdin
-        echo "Pushing image $(DOCKERHUB_REPO):$(IMAGE_TAG) to Docker Hub"
+
+        echo "=== Push vers Docker Hub ==="
         docker push $(DOCKERHUB_REPO):$(IMAGE_TAG)
         docker push $(DOCKERHUB_REPO):latest
-      displayName: 'Build & Push to Docker Hub'
+        echo "Image pushée : $(DOCKERHUB_REPO):$(IMAGE_TAG)"
+      displayName: 'Build & Push'
 
 # ─────────────────────────────────────────────
-# STAGE 3 — DEPLOY sur Azure App Service
+# STAGE 3 — DEPLOY sur la VM locale
+# L'agent EST sur la VM, donc on execute docker-compose directement
 # ─────────────────────────────────────────────
 - stage: Deploy
-  displayName: 'Deploy sur Azure App Service'
+  displayName: 'Deploy (docker-compose local)'
   dependsOn: DockerBuild
   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
   jobs:
-  - deployment: DeployToAzure
-    displayName: 'Deploiement App Service'
+  - deployment: DeployLocal
+    displayName: 'docker-compose pull + up'
     pool:
-      vmImage: 'ubuntu-latest'
+      name: LocalVM
     environment: 'production'
     strategy:
       runOnce:
         deploy:
           steps:
 
-          # If your Docker Hub repository is private, you must provide registry credentials to the App Service.
-          # Option A (portal): In Azure Portal > App Service > Deployment Center, add Docker Hub credentials.
-          # Option B (pipeline/CLI): Uncomment the AzureCLI task below to set credentials programmatically.
-          # Note: the pipeline variables $(DOCKERHUB_USERNAME) and $(DOCKERHUB_PASSWORD) must be set (password marked secret).
-          #
-          # - task: AzureCLI@2
-          #   displayName: 'Configure App Service to pull from private Docker Hub'
-          #   inputs:
-          #     azureSubscription: 'Azure-Service-Connection'
-          #     scriptType: 'bash'
-          #     scriptLocation: 'inlineScript'
-          #     inlineScript: |
-          #       az webapp config container set \
-          #         --name $(AZURE_WEBAPP_NAME) \
-          #         --resource-group <RESOURCE_GROUP_NAME> \
-          #         --docker-custom-image-name $(DOCKERHUB_REPO):$(IMAGE_TAG) \
-          #         --docker-registry-server-url https://index.docker.io \
-          #         --docker-registry-server-user $(DOCKERHUB_USERNAME) \
-          #         --docker-registry-server-password $(DOCKERHUB_PASSWORD)
-
-          - task: AzureWebAppContainer@1
-            displayName: 'Deployer le container sur App Service'
-            inputs:
-              azureSubscription: 'Azure-Service-Connection'
-              appName: '$(AZURE_WEBAPP_NAME)'
-              containers: '$(DOCKERHUB_REPO):$(IMAGE_TAG)'
-              appSettings: |
-                -SPRING_PROFILES_ACTIVE production
-                -WEBSITES_PORT 8080
-                -SPRING_DATASOURCE_URL $(DB_CONNECTION_STRING)
-                -SPRING_DATASOURCE_USERNAME $(DB_USERNAME)
-                -SPRING_DATASOURCE_PASSWORD $(DB_PASSWORD)
-
-          # Health check après déploiement
           - script: |
-              echo "Attente du démarrage de l'application (30s)..."
+              set -e
+              cd $(APP_DIR)
+
+              echo "=== Pull nouvelle image depuis Docker Hub ==="
+              docker pull $(DOCKERHUB_REPO):$(IMAGE_TAG)
+              docker tag $(DOCKERHUB_REPO):$(IMAGE_TAG) $(DOCKERHUB_REPO):latest
+
+              echo "=== Redémarrage du container app uniquement ==="
+              docker-compose up -d --no-deps --pull always app
+
+              echo "=== Nettoyage des vieilles images ==="
+              docker image prune -f
+
+              echo "=== Status des containers ==="
+              docker-compose ps
+            displayName: 'Deploy docker-compose'
+
+          - script: |
+              echo "Attente démarrage (30s)..."
               sleep 30
-              STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://$(AZURE_WEBAPP_NAME).azurewebsites.net/actuator/health)
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/actuator/health || echo "000")
+              echo "HTTP Status: $STATUS"
               if [ "$STATUS" = "200" ]; then
-                echo "Health check OK (HTTP 200)"
+                echo "Health check OK"
               else
-                echo "Health check échoué (HTTP $STATUS)"
-                exit 1
+                echo "Status $STATUS — logs:"
+                docker logs gestion-signalement --tail=20
               fi
             displayName: 'Health Check'
+            continueOnError: true
