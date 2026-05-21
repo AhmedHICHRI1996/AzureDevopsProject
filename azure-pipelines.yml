@@ -184,7 +184,7 @@ stages:
           - script: |
               echo "Attente démarrage (30s)..."
               sleep 30
-              STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/actuator/health || echo "000")
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/aec-api-rest/signalements || echo "000")
               echo "HTTP Status: $STATUS"
               if [ "$STATUS" = "200" ]; then
                 echo "Health check OK"
