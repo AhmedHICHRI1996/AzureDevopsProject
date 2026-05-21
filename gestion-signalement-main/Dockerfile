@@ -16,7 +16,7 @@ RUN mvn package -DskipTests -B
 # ─────────────────────────────────────────────
 # Stage 2 : Image runtime légère
 # ─────────────────────────────────────────────
-FROM openjdk:8-jre-slim
+FROM eclipse-temurin:8-jre
 
 WORKDIR /app
 
@@ -41,4 +41,5 @@ ENV JAVA_OPTS="-Xms256m -Xmx512m"
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
   CMD curl -f http://localhost:8080/actuator/health || exit 1
 
-ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]
+# ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]
+ENTRYPOINT ["java","-Djava.security.egd=file:/dev/.urandom","-jar","/app.jar"]
