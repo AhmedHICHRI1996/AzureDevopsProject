@@ -25,7 +25,7 @@ variables:
 # ─────────────────────────────────────────────
 # TOUS les stages tournent sur l'agent LOCAL
 # pool: name: LocalVM  (le pool créé dans Azure DevOps)
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────JavaToolInstaller@0
 
 stages:
 
@@ -53,13 +53,17 @@ stages:
           MYSQL_PASSWORD: apppassword
 
     steps:
+    - script: |
+        java -version
+        mvn -version
+      displayName: 'Vérifier Java & Maven'
 
-    - task: JavaToolInstaller@0
-      displayName: 'Java 8'
-      inputs:
-        versionSpec: '8'
-        jdkArchitectureOption: 'x64'
-        jdkSourceOption: 'PreInstalled'
+    # - task: JavaToolInstaller@0
+    #   displayName: 'Java 8'
+    #   inputs:
+    #     versionSpec: '8'
+    #     jdkArchitectureOption: 'x64'
+    #     jdkSourceOption: 'PreInstalled'
 
     - script: |
         echo "Waiting for MySQL..."
